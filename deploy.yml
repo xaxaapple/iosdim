@@ -1,0 +1,91 @@
+# Нужен только один секрет репозитория (Settings → Secrets and variables → Actions):
+#   VNC_PASSWORD — пароль, который вы зададите для подключения по VNC
+#
+# Токен/аккаунт больше не нужен: вместо ngrok используется bore
+# (https://github.com/ekzhang/bore, актуальная версия 0.6.0) — бесплатный
+# TCP-туннель с открытым исходным кодом. Он поднимает публичный адрес вида
+# bore.pub:<PORT> без регистрации и без привязки карты.
+#
+# Важно про bore: bore.pub — это общий бесплатный релей без SLA и без
+# собственного шифрования (это просто прозрачный TCP-проброс), поэтому вся
+# защита сессии — это пароль VNC_PASSWORD. Ставьте пароль подлиннее и не
+# запускайте workflow дольше, чем реально нужно.
+#
+# Ограничение по картинке: VNC подключается к рабочему столу целиком (это
+# стандартное поведение Screen Sharing в macOS — нельзя "прокинуть" только
+# одно окно), но workflow сразу разворачивает поверх всего именно
+# Simulator.app, так что по факту вы увидите на экране только симулятор.
+
+name: Xcode Simulator over VNC
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulator_device:
+        description: 'Имя симулятора, например "iPhone 16 Pro" (если не найдётся — возьмётся первый доступный iPhone)'
+        required: false
+        default: 'iPhone 16 Pro'
+      session_minutes:
+        description: 'Сколько минут держать сессию открытой (лимит раннера обычно 360 мин.)'
+        required: false
+        default: '60'
+
+jobs:
+  simulator-vnc:
+    name: Xcode Simulator via VNC
+    runs-on: macos-latest   # сейчас это macos-26, Xcode ставится по умолчанию последней стабильной версии
+
+    steps:
+      - name: Установка bore (бесплатный TCP-туннель, без аккаунта)
+        run: brew install bore-cli
+
+      - name: Включение Screen Sharing (VNC) со своим паролем
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASSWORD" \
+            -restart -agent -privs -all
+
+      - name: Загрузка и открытие нужного симулятора Xcode
+        env:
+          SIMULATOR_DEVICE: ${{ inputs.simulator_device }}
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available
+
+          # если запрошенной модели нет на этом образе — берём первый доступный iPhone
+          if xcrun simctl list devices available | grep -q "$SIMULATOR_DEVICE"; then
+            DEVICE_NAME="$SIMULATOR_DEVICE"
+          else
+            DEVICE_NAME=$(xcrun simctl list devices available | grep -m1 -oE 'iPhone [^(]+' | sed 's/[[:space:]]*$//')
+            echo "⚠️ '$SIMULATOR_DEVICE' не найден на этом образе, использую: $DEVICE_NAME"
+          fi
+
+          xcrun simctl boot "$DEVICE_NAME"
+          open -a Simulator
+          sleep 5
+
+      - name: Запуск VNC-туннеля через bore
+        run: |
+          nohup bore local 5900 --to bore.pub > /tmp/bore.log 2>&1 &
+          sleep 5
+          cat /tmp/bore.log
+
+      - name: Публикация адреса для подключения
+        run: |
+          BORE_ADDR=$(grep -oE 'listening at [^[:space:]]+' /tmp/bore.log | tail -1 | sed 's/listening at //')
+          {
+            echo "### 🖥️ Адрес для VNC-клиента"
+            echo "\`$BORE_ADDR\`"
+            echo ""
+            echo "Подключайтесь любым VNC-клиентом (Screen Sharing на Mac, RealVNC, TightVNC) на этот host:port, пароль — тот, что в секрете VNC_PASSWORD."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Держим сессию открытой (доп. SSH-доступ через tmate)
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+        timeout-minutes: ${{ fromJSON(inputs.session_minutes) }}
